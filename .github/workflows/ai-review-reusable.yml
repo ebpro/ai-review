@@ -1,0 +1,330 @@
+# AI Review (Reusable) — call this workflow from any repo to get AI code review.
+#
+# Consumer usage (copy into your repo's .github/workflows/):
+#   name: AI Review
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#   jobs:
+#     ai-review:
+#       if: github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+#       uses: ebpro/ai-review/.github/workflows/ai-review-reusable.yml@main
+#       with:
+#         pr_number: ${{ github.event.pull_request.number }}
+#         repo: ${{ github.repository }}
+#         agents: all          # "all" | "code" | "lecture" | '["review-security",...]'
+#       secrets: inherit
+#
+# Requires org secrets: LLM_REVIEW_ENDPOINT, LLM_REVIEW_TOKEN
+# Requires runners: linux, self-hosted, ebpro-ai-review, best-practices
+name: AI Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: string
+      repo:
+        description: 'Repository owner/name (e.g. ebpro/my-repo)'
+        required: true
+        type: string
+      agents:
+        description: 'Agent selection: "all", "code", "lecture", or JSON array of agent names'
+        required: false
+        default: 'all'
+        type: string
+    secrets:
+      LLM_REVIEW_ENDPOINT:
+        description: 'OpenAI-compatible API base URL'
+        required: false
+      LLM_REVIEW_TOKEN:
+        description: 'API key for the LLM endpoint'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PR_NUMBER: ${{ inputs.pr_number }}
+  REPO: ${{ inputs.repo }}
+
+jobs:
+  # ── Prep: runs once, shared by all review jobs ─────────────────────
+  prep:
+    name: Prep
+    runs-on:
+      - linux
+      - self-hosted
+      - ebpro-ai-review
+      - best-practices
+    timeout-minutes: 5
+    outputs:
+      empty_diff: ${{ steps.materialize.outputs.empty_diff }}
+      agents: ${{ steps.discover.outputs.agents }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Materialize PR diff
+        id: materialize
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="${GITHUB_WORKSPACE}/review-artifacts"
+          mkdir -p "$ARTIFACT_DIR"
+
+          gh pr diff "$PR_NUMBER" --repo "$REPO" > "${ARTIFACT_DIR}/pr.diff" 2>/dev/null || true
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' > "${ARTIFACT_DIR}/changed.txt" 2>/dev/null || true
+
+          # Truncation guard: prevent context overflow on very large PRs
+          DIFF_LINES=$(wc -l < "${ARTIFACT_DIR}/pr.diff")
+          if [ "$DIFF_LINES" -gt 6000 ]; then
+            head -n 6000 "${ARTIFACT_DIR}/pr.diff" > "${ARTIFACT_DIR}/pr.diff.trunc"
+            mv "${ARTIFACT_DIR}/pr.diff.trunc" "${ARTIFACT_DIR}/pr.diff"
+            echo "::warning::PR diff truncated at 6000 lines (was ${DIFF_LINES})"
+          fi
+
+          # Empty diff guard
+          if [ -s "${ARTIFACT_DIR}/pr.diff" ]; then
+            echo "empty_diff=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty_diff=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::No reviewable diff (gh pr diff returned empty or failed)"
+          fi
+
+      - name: Verify LLM connectivity
+        if: steps.materialize.outputs.empty_diff == 'false'
+        env:
+          LLM_REVIEW_ENDPOINT: ${{ secrets.LLM_REVIEW_ENDPOINT }}
+          LLM_REVIEW_TOKEN: ${{ secrets.LLM_REVIEW_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LLM_REVIEW_ENDPOINT:-}" ]; then
+            echo "::error::LLM_REVIEW_ENDPOINT is empty"
+            exit 1
+          fi
+          if [ -z "${LLM_REVIEW_TOKEN:-}" ]; then
+            echo "::error::LLM_REVIEW_TOKEN is empty"
+            exit 1
+          fi
+          echo "::notice::LLM_REVIEW_ENDPOINT set (${#LLM_REVIEW_ENDPOINT} chars)"
+          echo "::notice::LLM_REVIEW_TOKEN set (${#LLM_REVIEW_TOKEN} chars)"
+
+          HTTP_CODE=$(curl -s -o /tmp/llm-prep-test.json -w "%{http_code}" \
+            "${LLM_REVIEW_ENDPOINT}/chat/completions" \
+            -H "Authorization: Bearer ${LLM_REVIEW_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"model":"lismodel1","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' \
+            --max-time 30)
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "::notice::LLM endpoint OK (HTTP 200)"
+          else
+            echo "::error::LLM endpoint returned HTTP ${HTTP_CODE}"
+            cat /tmp/llm-prep-test.json 2>/dev/null || true
+            exit 1
+          fi
+          rm -f /tmp/llm-prep-test.json
+
+      - name: Discover agents
+        id: discover
+        if: steps.materialize.outputs.empty_diff == 'false'
+        run: |
+          set -euo pipefail
+
+          # Agent group definitions
+          CODE_AGENTS='["review-security","review-performance","review-tests","review-architecture","review-docs"]'
+          LECTURE_AGENTS='["review-lecture-content","review-lecture-pedagogy","review-lecture-format","review-lecture-language","review-lecture-exercises","review-lecture-visuals"]'
+
+          AGENT_INPUT="${{ inputs.agents }}"
+
+          if [ "$AGENT_INPUT" = "all" ]; then
+            # Discover from repo agents/ dir, fall back to image agents
+            if [ -d "agents" ] && ls agents/*.md &>/dev/null; then
+              AGENTS=$(ls agents/*.md | sed 's|agents/||;s|\.md$||' | sort | jq -R . | jq -s -c .)
+            else
+              AGENTS=$(ls ~/.config/opencode/agents/*.md 2>/dev/null | sed 's|.*/||;s|\.md$||' | sort | jq -R . | jq -s -c .)
+            fi
+            if [ -z "$AGENTS" ] || [ "$AGENTS" = "[]" ]; then
+              echo "::error::No agents found (checked agents/ and ~/.config/opencode/agents/)"
+              exit 1
+            fi
+          elif [ "$AGENT_INPUT" = "code" ]; then
+            AGENTS="$CODE_AGENTS"
+          elif [ "$AGENT_INPUT" = "lecture" ]; then
+            AGENTS="$LECTURE_AGENTS"
+          else
+            # Assume JSON array — validate it
+            echo "$AGENT_INPUT" | jq -e 'type == "array" and length > 0' &>/dev/null || {
+              echo "::error::agents input must be \"all\", \"code\", \"lecture\", or a non-empty JSON array"
+              exit 1
+            }
+            AGENTS="$AGENT_INPUT"
+          fi
+
+          COUNT=$(echo "$AGENTS" | jq 'length')
+          echo "::notice::Selected ${COUNT} agents: $AGENTS"
+          echo "agents=${AGENTS}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload review artifacts
+        if: steps.materialize.outputs.empty_diff == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-artifacts
+          path: "review-artifacts/"
+          retention-days: 1
+          if-no-files-found: error
+
+  # ── Review: one job per agent, consumes prep artifacts ─────────────
+  review:
+    name: "review: ${{ matrix.agent }}"
+    needs: prep
+    if: needs.prep.outputs.empty_diff == 'false'
+    runs-on:
+      - linux
+      - self-hosted
+      - ebpro-ai-review
+      - best-practices
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJSON(needs.prep.outputs.agents) }}
+
+    steps:
+      - name: Download review artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: review-artifacts
+          path: ./review-artifacts
+
+      - name: Run AI review agent
+        env:
+          LLM_REVIEW_ENDPOINT: ${{ secrets.LLM_REVIEW_ENDPOINT }}
+          LLM_REVIEW_TOKEN: ${{ secrets.LLM_REVIEW_TOKEN }}
+        run: |
+          set -euo pipefail
+          AGENT="${{ matrix.agent }}"
+
+          # Per-job output directory (safe on shared runners)
+          OUTPUT_DIR=$(mktemp -d /tmp/review-out-XXXXXX)
+          echo "OUTPUT_DIR=${OUTPUT_DIR}" >> "$GITHUB_ENV"
+
+          # Isolated working directory
+          WORKDIR=$(mktemp -d /tmp/oc-review.XXXXXX)
+          cd "$WORKDIR"
+          git init -q
+          cp "${GITHUB_WORKSPACE}/review-artifacts/pr.diff" ./pr.diff
+          cp "${GITHUB_WORKSPACE}/review-artifacts/changed.txt" ./changed.txt
+
+          # Run the agent. Non-blocking: crash produces a failure notice.
+          if opencode run \
+              --agent "${AGENT}" \
+              -f ./pr.diff \
+              -f ./changed.txt \
+              -- "Review the attached PR diff. The changed files are listed in changed.txt. Provide your review following the REVIEW-CONTRACT format: Verdict (APPROVE | CHANGES-REQUESTED | BLOCK), Findings (P0/P1/P2 with Location/Evidence/Impact/Recommendation), Areas Checked, Confidence." \
+              > "${OUTPUT_DIR}/${AGENT}.md" 2>&1; then
+            echo "::notice::${AGENT} completed"
+          else
+            EXIT_CODE=$?
+            echo "::warning::${AGENT} exited with code ${EXIT_CODE}"
+
+            # Sanitized error output: last 50 lines, redact URLs and tokens
+            ERROR_OUTPUT=$(tail -50 "${OUTPUT_DIR}/${AGENT}.md" 2>/dev/null \
+              | sed -E 's|https?://[^ "]+|[REDACTED_URL]|g; s|Bearer [A-Za-z0-9._-]+|Bearer [REDACTED]|g' \
+              || echo "(no output captured)")
+            echo "::error::review-${AGENT} sanitized output (last 50 lines):"
+            echo "${ERROR_OUTPUT}"
+            echo "::error::end output"
+
+            {
+              echo "# Verdict"
+              echo ""
+              echo "BLOCK"
+              echo "Agent ${AGENT} failed to complete (exit code ${EXIT_CODE})."
+              echo ""
+              echo "# Findings"
+              echo ""
+              echo "## [P0] Agent execution failure"
+              echo "Location:       n/a"
+              echo "Evidence:       opencode exited with code ${EXIT_CODE}"
+              echo "Impact:         Review could not be completed"
+              echo "Recommendation: Check LLM endpoint availability and agent configuration"
+              echo ""
+              echo "# Areas Checked"
+              echo ""
+              echo "None — agent failed before producing output."
+              echo ""
+              echo "# Confidence"
+              echo ""
+              echo "0 — agent did not complete"
+            } > "${OUTPUT_DIR}/${AGENT}.md"
+          fi
+
+          cd /
+          rm -rf "$WORKDIR"
+
+      - name: Post PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          AGENT="${{ matrix.agent }}"
+          MARKER="<!-- ai-review:${AGENT} -->"
+
+          # Delete existing comment for this agent (single page)
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" \
+            | while read -r cid; do
+                gh api -X DELETE "repos/${REPO}/issues/comments/${cid}" 2>/dev/null || true
+              done
+
+          # Compose and post
+          {
+            echo "${MARKER}"
+            echo "### 🤖 \`${AGENT}\` Review"
+            echo ""
+            cat "${OUTPUT_DIR}/${AGENT}.md"
+          } > "${GITHUB_WORKSPACE}/comment-${AGENT}.md"
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="$(cat "${GITHUB_WORKSPACE}/comment-${AGENT}.md")"
+          echo "::notice::Posted review comment for ${AGENT}"
+
+          rm -rf "${OUTPUT_DIR}"
+          rm -f "${GITHUB_WORKSPACE}/comment-${AGENT}.md"
+
+  # ── No-diff notice ─────────────────────────────────────────────────
+  no-diff-notice:
+    name: No-diff notice
+    needs: prep
+    if: needs.prep.outputs.empty_diff == 'true'
+    runs-on:
+      - linux
+      - self-hosted
+      - ebpro-ai-review
+      - best-practices
+    timeout-minutes: 2
+    steps:
+      - name: Post no-diff notice
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MARKER="<!-- ai-review:notice -->"
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="${MARKER}
+          ### ⚠️ AI Review Skipped
+
+          No reviewable diff was found. AI review will run on the next push with a non-empty diff."
