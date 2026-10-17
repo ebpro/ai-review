@@ -223,6 +223,43 @@ jobs:
           OUTPUT_DIR=$(mktemp -d /tmp/review-out-XXXXXX)
           echo "OUTPUT_DIR=${OUTPUT_DIR}" >> "$GITHUB_ENV"
 
+          # ── Output hygiene helpers ─────────────────────────────────
+          # sanitize_output: normalize captured agent output to clean markdown.
+          #   1. strip ANSI/terminal control sequences (CSI, OSC incl. ST-terminated)
+          #      plus stray ESC and CR bytes
+          #   2. drop opencode internal todo/progress lines (headers matching
+          #      "# ...Todos" and checkbox status lines "[ ]" "[x]" "[✓]" "[•]",
+          #      with or without a leading markdown bullet)
+          #   3. collapse runs of blank lines and trim leading/trailing blanks
+          # LC_ALL=C keeps sed byte-oriented so \xNN escapes match raw UTF-8
+          # bytes (✓ = e2 9c 93, • = e2 80 a2) regardless of runner locale.
+          sanitize_output() {
+            LC_ALL=C sed -r \
+              -e 's/\x1B\[[0-9;?]*[a-zA-Z]//g' \
+              -e 's/\x1B\][^\x07]*\x07//g' \
+              -e 's/\x1B\][^\x07\x1B]*\x1B\\//g' \
+              -e 's/\x1B[\x40-\x5F]//g' \
+              | tr -d '\r\033' \
+              | LC_ALL=C sed -E \
+                -e '/^#[[:space:]]*.*Todos/Id' \
+                -e '/^[[:space:]]*([-*+][[:space:]]*)?\[[ x]\]([[:space:]]|$)/d' \
+                -e '/^[[:space:]]*([-*+][[:space:]]*)?\[(\xe2\x9c\x93|\xe2\x80\xa2)\]([[:space:]]|$)/d' \
+              | cat -s \
+              | LC_ALL=C awk '
+                  { lines[NR] = $0 }
+                  END {
+                    s = 1; e = NR
+                    while (s <= e && lines[s] ~ /^[ \t]*$/) s++
+                    while (e >= s && lines[e] ~ /^[ \t]*$/) e--
+                    for (i = s; i <= e; i++) print lines[i]
+                  }'
+          }
+          # redact_output: secret scrubbing for failure diagnostics only.
+          # Never applied to successful review bodies (legit doc URLs survive).
+          redact_output() {
+            LC_ALL=C sed -E 's|https?://[^ "]+|[REDACTED_URL]|g; s|Bearer [A-Za-z0-9._-]+|Bearer [REDACTED]|g'
+          }
+
           # Isolated working directory
           WORKDIR=$(mktemp -d /tmp/oc-review.XXXXXX)
           cd "$WORKDIR"
@@ -231,20 +268,29 @@ jobs:
           cp "${GITHUB_WORKSPACE}/review-artifacts/changed.txt" ./changed.txt
 
           # Run the agent. Non-blocking: crash produces a failure notice.
-          if opencode run \
-              --agent "${AGENT}" \
-              -f ./pr.diff \
-              -f ./changed.txt \
-              -- "Review the attached PR diff. The changed files are listed in changed.txt. Provide your review following the REVIEW-CONTRACT format: Verdict (APPROVE | CHANGES-REQUESTED | BLOCK), Findings (P0/P1/P2 with Location/Evidence/Impact/Recommendation), Areas Checked, Confidence." \
-              > "${OUTPUT_DIR}/${AGENT}.md" 2>&1; then
+          EXIT_CODE=0
+          opencode run \
+            --agent "${AGENT}" \
+            -f ./pr.diff \
+            -f ./changed.txt \
+            -- "Review the attached PR diff. The changed files are listed in changed.txt. Provide your review following the REVIEW-CONTRACT format: Verdict (APPROVE | CHANGES-REQUESTED | BLOCK), Findings (P0/P1/P2 with Location/Evidence/Impact/Recommendation), Areas Checked, Confidence. Output discipline: your final message must contain ONLY the review in the contracted format. Plain professional markdown. No emoji, no decorative separators or long dashes, no ANSI or terminal control codes, no todo/progress lists, no preamble or meta-commentary. Concise for humans, unambiguous headings for machines." \
+            > "${OUTPUT_DIR}/${AGENT}.md" 2>&1 || EXIT_CODE=$?
+
+          # Normalize the captured output in place BEFORE any tail/truncation
+          # or posting, so size guards count real content, not ANSI bytes.
+          sanitize_output \
+            < "${OUTPUT_DIR}/${AGENT}.md" \
+            > "${OUTPUT_DIR}/${AGENT}.md.tmp" \
+            && mv "${OUTPUT_DIR}/${AGENT}.md.tmp" "${OUTPUT_DIR}/${AGENT}.md"
+
+          if [ "${EXIT_CODE}" -eq 0 ]; then
             echo "::notice::${AGENT} completed"
           else
-            EXIT_CODE=$?
             echo "::warning::${AGENT} exited with code ${EXIT_CODE}"
 
             # Sanitized error output: last 50 lines, redact URLs and tokens
             ERROR_OUTPUT=$(tail -50 "${OUTPUT_DIR}/${AGENT}.md" 2>/dev/null \
-              | sed -E 's|https?://[^ "]+|[REDACTED_URL]|g; s|Bearer [A-Za-z0-9._-]+|Bearer [REDACTED]|g' \
+              | redact_output \
               || echo "(no output captured)")
             echo "::error::review-${AGENT} sanitized output (last 50 lines):"
             echo "${ERROR_OUTPUT}"
@@ -280,10 +326,12 @@ jobs:
       - name: Post PR comment
         env:
           GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           AGENT="${{ matrix.agent }}"
           MARKER="<!-- ai-review:${AGENT} -->"
+          REVIEW_DATE="$(date -u +%Y-%m-%d)"
 
           # Delete existing comment for this agent (single page)
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
@@ -292,10 +340,14 @@ jobs:
                 gh api -X DELETE "repos/${REPO}/issues/comments/${cid}" 2>/dev/null || true
               done
 
-          # Compose and post
+          # Compose and post. Sober wrapper: the marker MUST remain the very
+          # first line (comment cleanup matches on startswith) and the body is
+          # already sanitized in the review step.
           {
             echo "${MARKER}"
-            echo "### 🤖 \`${AGENT}\` Review"
+            echo "## AI Review — \`${AGENT}\`"
+            echo ""
+            echo "Model: lismodel1 · Commit: ${COMMIT_SHA} · ${REVIEW_DATE}"
             echo ""
             cat "${OUTPUT_DIR}/${AGENT}.md"
           } > "${GITHUB_WORKSPACE}/comment-${AGENT}.md"
@@ -325,6 +377,6 @@ jobs:
           set -euo pipefail
           MARKER="<!-- ai-review:notice -->"
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="${MARKER}
-          ### ⚠️ AI Review Skipped
+          ## AI Review Skipped
 
           No reviewable diff was found. AI review will run on the next push with a non-empty diff."
