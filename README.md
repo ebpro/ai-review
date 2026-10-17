@@ -38,8 +38,17 @@ jobs:
       pr_number: ${{ github.event.pull_request.number }}
       repo: ${{ github.repository }}
       agents: all          # "all" | "code" | "lecture" | '["review-security",...]'
-    secrets: inherit
+    secrets:
+      LLM_REVIEW_ENDPOINT: ${{ secrets.LLM_REVIEW_ENDPOINT }}
+      LLM_REVIEW_TOKEN: ${{ secrets.LLM_REVIEW_TOKEN }}
 ```
+
+Why explicit named secrets instead of `secrets: inherit`: **least
+privilege** — the review job receives only these two values, not every
+repository/org secret an `inherit` would forward to the called workflow.
+On ref pinning: `@main` is used here for teaching convenience; the hub is
+org-owned. If you want stronger guarantees, pin a commit SHA
+(`@<full-sha>`) and/or enable the org-level "require SHA pinning" setting.
 
 ### Inputs
 
@@ -56,7 +65,9 @@ For the workflow to execute (not just parse), the consuming repo needs:
 1. **Org secrets shared to it**: `LLM_REVIEW_ENDPOINT` and `LLM_REVIEW_TOKEN`
    (GitHub org/user secrets → *Secrets and variables* → *Actions* → repository
    access, or `dependabot`-style selected access). Set at the org level, the
-   caller passes them through with `secrets: inherit`.
+   caller passes them through with an explicit named-secret mapping
+   (`LLM_REVIEW_ENDPOINT: ${{ secrets.LLM_REVIEW_ENDPOINT }}`, etc.), which
+   resolves org-level secrets in the caller context.
    - **Public repos need the secrets' visibility widened to public repos** —
      by default org secrets are visible only to private repositories.
 2. **Runner access**: the workflow targets self-hosted runners labeled
@@ -90,8 +101,9 @@ PRs always run.
   runner image** built by
   [`ebpro/quarkus-ci-runner`](https://github.com/ebpro/quarkus-ci-runner);
   nothing sensitive is evaluated from this repo's contents.
-- Org secrets reach the runner only through `secrets: inherit` on PRs from
-  **same-repo branches** (fork PRs are skipped, see above).
+- Org secrets reach the runner only through the explicit named-secret
+  passthrough above, on PRs from **same-repo branches** (fork PRs are
+  skipped, see above).
 - The reusable workflow only reads your PR diff and posts comments; it never
   writes to your repository.
 
