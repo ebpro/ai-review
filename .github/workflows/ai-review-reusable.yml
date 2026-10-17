@@ -230,13 +230,20 @@ jobs:
           #   2. drop opencode internal todo/progress lines (headers matching
           #      "# ...Todos" and checkbox status lines "[ ]" "[x]" "[✓]" "[•]",
           #      with or without a leading markdown bullet)
-          #   3. drop opencode skill-loading stderr lines (lines starting with
-          #      "✗ Skill ", "→ Skill " or "Error: Skill "; anchored so mid-line
-          #      arrows in review prose survive)
-          #   4. collapse runs of blank lines and trim leading/trailing blanks
+          #   3. drop opencode tool-stderr lines (lines starting with
+          #      "✗ Skill ", "→ Skill ", "✗ Invalid Tool", "Error: Skill " or
+          #      "Error: Tool error ", plus the fixed continuation line
+          #      "The arguments provided to the tool are invalid: ..."; all
+          #      anchored at line start so mid-line arrows in review prose
+          #      and legitimate text survive)
+          #   4. drop the opencode session header echoed to stdout
+          #      ("> <agent-name> · <model>"; U+00B7 = \xc2\xb7). Narrow:
+          #      requires the lowercase-hyphen-name · pattern, never a
+          #      blanket "^>" — markdown blockquotes survive.
+          #   5. collapse runs of blank lines and trim leading/trailing blanks
           # LC_ALL=C keeps sed byte-oriented so \xNN escapes match raw UTF-8
-          # bytes (✓ = e2 9c 93, • = e2 80 a2, ✗ = e2 9c 97, → = e2 86 92)
-          # regardless of runner locale.
+          # bytes (✓ = e2 9c 93, • = e2 80 a2, ✗ = e2 9c 97, → = e2 86 92,
+          # · = c2 b7) regardless of runner locale.
           sanitize_output() {
             LC_ALL=C sed -r \
               -e 's/\x1B\[[0-9;?]*[a-zA-Z]//g' \
@@ -248,8 +255,11 @@ jobs:
                 -e '/^#[[:space:]]*.*Todos/Id' \
                 -e '/^[[:space:]]*([-*+][[:space:]]*)?\[[ x]\]([[:space:]]|$)/d' \
                 -e '/^[[:space:]]*([-*+][[:space:]]*)?\[(\xe2\x9c\x93|\xe2\x80\xa2)\]([[:space:]]|$)/d' \
-                -e '/^(\xe2\x9c\x97|\xe2\x86\x92)[[:space:]]+Skill[[:space:]]/d' \
-                -e '/^Error:[[:space:]]+Skill[[:space:]]/d' \
+                -e '/^(\xe2\x9c\x97|\xe2\x86\x92)[[:space:]]+(Skill|Invalid Tool)([[:space:]]|:|$)/d' \
+                -e '/^Error:[[:space:]]+Skill([[:space:]]|$)/d' \
+                -e '/^Error:[[:space:]]+Tool error/d' \
+                -e '/^The arguments provided to the tool are invalid/d' \
+                -e '/^>[[:space:]]+[a-z][a-z-]*[[:space:]]\xc2\xb7[[:space:]]/d' \
               | cat -s \
               | LC_ALL=C awk '
                   { lines[NR] = $0 }
@@ -265,6 +275,35 @@ jobs:
           redact_output() {
             LC_ALL=C sed -E 's|https?://[^ "]+|[REDACTED_URL]|g; s|Bearer [A-Za-z0-9._-]+|Bearer [REDACTED]|g'
           }
+          # write_block_fallback: emit the BLOCK verdict template over the
+          # review file so consumers never see a verdict-less stub (and the
+          # comment-cleanup markers still work).
+          #   $1 = note line printed under the BLOCK verdict
+          #   $2 = evidence line for the P0 finding
+          write_block_fallback() {
+            {
+              echo "# Verdict"
+              echo ""
+              echo "BLOCK"
+              echo "$1"
+              echo ""
+              echo "# Findings"
+              echo ""
+              echo "## [P0] Agent execution failure"
+              echo "Location:       n/a"
+              echo "Evidence:       $2"
+              echo "Impact:         Review could not be completed"
+              echo "Recommendation: Check LLM endpoint availability and agent configuration"
+              echo ""
+              echo "# Areas Checked"
+              echo ""
+              echo "None — agent failed before producing output."
+              echo ""
+              echo "# Confidence"
+              echo ""
+              echo "0 — agent did not complete"
+            } > "${OUTPUT_DIR}/${AGENT}.md"
+          }
 
           # Isolated working directory
           WORKDIR=$(mktemp -d /tmp/oc-review.XXXXXX)
@@ -279,7 +318,7 @@ jobs:
             --agent "${AGENT}" \
             -f ./pr.diff \
             -f ./changed.txt \
-            -- "Review the attached PR diff. The changed files are listed in changed.txt. Provide your review following the REVIEW-CONTRACT format: Verdict (APPROVE | CHANGES-REQUESTED | BLOCK), Findings (P0/P1/P2 with Location/Evidence/Impact/Recommendation), Areas Checked, Confidence. Output discipline: your final message must contain ONLY the review in the contracted format. Plain professional markdown. No emoji, no decorative separators or long dashes, no ANSI or terminal control codes, no todo/progress lists, no preamble or meta-commentary. Concise for humans, unambiguous headings for machines." \
+            -- "Review the attached PR diff. The changed files are listed in changed.txt. Provide your review following the REVIEW-CONTRACT format: Verdict (APPROVE | CHANGES-REQUESTED | BLOCK), Findings (P0/P1/P2 with Location/Evidence/Impact/Recommendation), Areas Checked, Confidence. Output discipline: your final message must contain ONLY the review in the contracted format. Plain professional markdown. No emoji, no decorative separators or long dashes, no ANSI or terminal control codes, no todo/progress lists, no preamble or meta-commentary. Concise for humans, unambiguous headings for machines. You cannot access files or tools — the attached PR diff is your only input; do not attempt file/tool calls." \
             > "${OUTPUT_DIR}/${AGENT}.md" 2>&1 || EXIT_CODE=$?
 
           # Normalize the captured output in place BEFORE any tail/truncation
@@ -289,9 +328,7 @@ jobs:
             > "${OUTPUT_DIR}/${AGENT}.md.tmp" \
             && mv "${OUTPUT_DIR}/${AGENT}.md.tmp" "${OUTPUT_DIR}/${AGENT}.md"
 
-          if [ "${EXIT_CODE}" -eq 0 ]; then
-            echo "::notice::${AGENT} completed"
-          else
+          if [ "${EXIT_CODE}" -ne 0 ]; then
             echo "::warning::${AGENT} exited with code ${EXIT_CODE}"
 
             # Sanitized error output: last 50 lines, redact URLs and tokens
@@ -302,28 +339,25 @@ jobs:
             echo "${ERROR_OUTPUT}"
             echo "::error::end output"
 
-            {
-              echo "# Verdict"
-              echo ""
-              echo "BLOCK"
-              echo "Agent ${AGENT} failed to complete (exit code ${EXIT_CODE})."
-              echo ""
-              echo "# Findings"
-              echo ""
-              echo "## [P0] Agent execution failure"
-              echo "Location:       n/a"
-              echo "Evidence:       opencode exited with code ${EXIT_CODE}"
-              echo "Impact:         Review could not be completed"
-              echo "Recommendation: Check LLM endpoint availability and agent configuration"
-              echo ""
-              echo "# Areas Checked"
-              echo ""
-              echo "None — agent failed before producing output."
-              echo ""
-              echo "# Confidence"
-              echo ""
-              echo "0 — agent did not complete"
-            } > "${OUTPUT_DIR}/${AGENT}.md"
+            write_block_fallback \
+              "Agent ${AGENT} failed to complete (exit code ${EXIT_CODE})." \
+              "opencode exited with code ${EXIT_CODE}"
+          else
+            # Exit-0 guard: an empty or near-empty sanitized body means the
+            # agent produced no review content (e.g. the model returned only
+            # the session header, since stripped). 120 bytes is well below
+            # the shortest meaningful REVIEW-CONTRACT body, so a real review
+            # can never trip this. Substitute the BLOCK fallback instead of
+            # posting a verdict-less stub.
+            BODY_BYTES=$(wc -c < "${OUTPUT_DIR}/${AGENT}.md" | tr -d '[:space:]')
+            if [ "${BODY_BYTES}" -lt 120 ]; then
+              echo "::warning::${AGENT} exited 0 with no review content (${BODY_BYTES} bytes after sanitization)"
+              write_block_fallback \
+                "Agent ${AGENT} produced no review content (exit 0, ${BODY_BYTES} bytes after sanitization)." \
+                "opencode exited with code 0 but sanitized output was empty or near-empty (${BODY_BYTES} bytes)"
+            else
+              echo "::notice::${AGENT} completed"
+            fi
           fi
 
           cd /
