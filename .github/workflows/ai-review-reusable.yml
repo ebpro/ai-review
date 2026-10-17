@@ -230,9 +230,13 @@ jobs:
           #   2. drop opencode internal todo/progress lines (headers matching
           #      "# ...Todos" and checkbox status lines "[ ]" "[x]" "[✓]" "[•]",
           #      with or without a leading markdown bullet)
-          #   3. collapse runs of blank lines and trim leading/trailing blanks
+          #   3. drop opencode skill-loading stderr lines (lines starting with
+          #      "✗ Skill ", "→ Skill " or "Error: Skill "; anchored so mid-line
+          #      arrows in review prose survive)
+          #   4. collapse runs of blank lines and trim leading/trailing blanks
           # LC_ALL=C keeps sed byte-oriented so \xNN escapes match raw UTF-8
-          # bytes (✓ = e2 9c 93, • = e2 80 a2) regardless of runner locale.
+          # bytes (✓ = e2 9c 93, • = e2 80 a2, ✗ = e2 9c 97, → = e2 86 92)
+          # regardless of runner locale.
           sanitize_output() {
             LC_ALL=C sed -r \
               -e 's/\x1B\[[0-9;?]*[a-zA-Z]//g' \
@@ -244,6 +248,8 @@ jobs:
                 -e '/^#[[:space:]]*.*Todos/Id' \
                 -e '/^[[:space:]]*([-*+][[:space:]]*)?\[[ x]\]([[:space:]]|$)/d' \
                 -e '/^[[:space:]]*([-*+][[:space:]]*)?\[(\xe2\x9c\x93|\xe2\x80\xa2)\]([[:space:]]|$)/d' \
+                -e '/^(\xe2\x9c\x97|\xe2\x86\x92)[[:space:]]+Skill[[:space:]]/d' \
+                -e '/^Error:[[:space:]]+Skill[[:space:]]/d' \
               | cat -s \
               | LC_ALL=C awk '
                   { lines[NR] = $0 }
