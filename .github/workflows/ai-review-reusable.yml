@@ -57,6 +57,16 @@ defaults:
 env:
   PR_NUMBER: ${{ inputs.pr_number }}
   REPO: ${{ inputs.repo }}
+  # Single source for the review model name used by the LLM pre-flight probe
+  # and by the review-comment header. The authoritative pin is the agent
+  # definition baked into the private runner image (`model: review-llm/<name>`
+  # in ebpro/quarkus-ci-runner); this value is probe/display only and is never
+  # passed to opencode, which resolves the model from the agent file itself.
+  REVIEW_MODEL: lismodel1
+  # Informational assertion for the opencode binary on the runner. The image
+  # ARG is the real pin: a mismatch is surfaced as a warning + job-summary
+  # note, it never fails a review.
+  EXPECTED_OPENCODE_VERSION: "1.18.35"
 
 jobs:
   # ── Prep: runs once, shared by all review jobs ─────────────────────
@@ -87,8 +97,22 @@ jobs:
           ARTIFACT_DIR="${GITHUB_WORKSPACE}/review-artifacts"
           mkdir -p "$ARTIFACT_DIR"
 
-          gh pr diff "$PR_NUMBER" --repo "$REPO" > "${ARTIFACT_DIR}/pr.diff" 2>/dev/null || true
-          gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' > "${ARTIFACT_DIR}/changed.txt" 2>/dev/null || true
+          # Fail loud on a gh pr diff error: an API/auth/rate-limit failure must
+          # never be mistaken for "nothing to review". A genuinely empty diff is
+          # NOT an error — gh exits 0 with no output there, which is what the
+          # file-size guard below detects and turns into empty_diff=true.
+          if ! gh pr diff "$PR_NUMBER" --repo "$REPO" > "${ARTIFACT_DIR}/pr.diff"; then
+            echo "::error::gh pr diff failed for ${REPO}#${PR_NUMBER}"
+            exit 1
+          fi
+
+          # changed.txt is supplementary context for the reviewers, not a gate:
+          # keep it non-fatal, but stop swallowing the reason for a failure.
+          # (The redirect has already created the file, so downstream copies
+          # still find it, possibly empty.)
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' \
+            > "${ARTIFACT_DIR}/changed.txt" \
+            || echo "::warning::gh pr view --json files failed for ${REPO}#${PR_NUMBER}; changed.txt may be incomplete"
 
           # Truncation guard: prevent context overflow on very large PRs
           DIFF_LINES=$(wc -l < "${ARTIFACT_DIR}/pr.diff")
@@ -98,12 +122,12 @@ jobs:
             echo "::warning::PR diff truncated at 6000 lines (was ${DIFF_LINES})"
           fi
 
-          # Empty diff guard
+          # Empty diff guard (legit case only: gh pr diff succeeded above)
           if [ -s "${ARTIFACT_DIR}/pr.diff" ]; then
             echo "empty_diff=false" >> "$GITHUB_OUTPUT"
           else
             echo "empty_diff=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::No reviewable diff (gh pr diff returned empty or failed)"
+            echo "::warning::No reviewable diff: gh pr diff succeeded but returned no changes for ${REPO}#${PR_NUMBER}"
           fi
 
       - name: Verify LLM connectivity
@@ -128,7 +152,7 @@ jobs:
             "${LLM_REVIEW_ENDPOINT}/chat/completions" \
             -H "Authorization: Bearer ${LLM_REVIEW_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d '{"model":"lismodel1","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' \
+            -d "{\"model\":\"${REVIEW_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":5}" \
             --max-time 30)
           if [ "$HTTP_CODE" = "200" ]; then
             echo "::notice::LLM endpoint OK (HTTP 200)"
@@ -142,6 +166,8 @@ jobs:
       - name: Discover agents
         id: discover
         if: steps.materialize.outputs.empty_diff == 'false'
+        env:
+          AGENTS_INPUT: "${{ inputs.agents }}"
         run: |
           set -euo pipefail
 
@@ -149,7 +175,7 @@ jobs:
           CODE_AGENTS='["review-security","review-performance","review-tests","review-architecture","review-docs"]'
           LECTURE_AGENTS='["review-lecture-content","review-lecture-pedagogy","review-lecture-format","review-lecture-language","review-lecture-exercises","review-lecture-visuals"]'
 
-          AGENT_INPUT="${{ inputs.agents }}"
+          AGENT_INPUT="${AGENTS_INPUT}"
 
           if [ "$AGENT_INPUT" = "all" ]; then
             # Discover from repo agents/ dir, fall back to image agents
@@ -215,9 +241,35 @@ jobs:
         env:
           LLM_REVIEW_ENDPOINT: ${{ secrets.LLM_REVIEW_ENDPOINT }}
           LLM_REVIEW_TOKEN: ${{ secrets.LLM_REVIEW_TOKEN }}
+          AGENT: "${{ matrix.agent }}"
         run: |
           set -euo pipefail
-          AGENT="${{ matrix.agent }}"
+
+          # ── Runner toolchain assertion (informational, never fatal) ──
+          # The image ARG is the authoritative opencode pin; each matrix job can
+          # land on a different runner pod, so the check runs next to the binary
+          # it is about to exec. A drift is reported, a review is still posted.
+          # Only the numeric core is compared, so any "v"/product-name prefix in
+          # the CLI output is tolerated. `|| true` keeps a missing binary from
+          # killing the step under set -e / pipefail.
+          OPENCODE_VERSION_RAW=$(opencode --version 2>&1 | head -n1 || true)
+          OPENCODE_VERSION=$(printf '%s' "$OPENCODE_VERSION_RAW" \
+            | LC_ALL=C grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+          : "${OPENCODE_VERSION:=unknown}"
+          if [ "${OPENCODE_VERSION}" != "${EXPECTED_OPENCODE_VERSION}" ]; then
+            echo "::warning::opencode version mismatch: runner reports ${OPENCODE_VERSION_RAW:-<no output>}, workflow expects ${EXPECTED_OPENCODE_VERSION} (image is the real pin)"
+            {
+              echo "## opencode version mismatch"
+              echo ""
+              echo "- agent: \`${AGENT}\`"
+              echo "- \`opencode --version\`: \`${OPENCODE_VERSION_RAW:-<no output>}\` (parsed: \`${OPENCODE_VERSION}\`)"
+              echo "- \`EXPECTED_OPENCODE_VERSION\`: \`${EXPECTED_OPENCODE_VERSION}\`"
+              echo ""
+              echo "Non-fatal by design: the runner image pins opencode; this job continued with the version above."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::notice::opencode ${OPENCODE_VERSION} matches EXPECTED_OPENCODE_VERSION"
+          fi
 
           # Per-job output directory (safe on shared runners)
           OUTPUT_DIR=$(mktemp -d /tmp/review-out-XXXXXX)
@@ -367,18 +419,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT_SHA: ${{ github.sha }}
+          AGENT: "${{ matrix.agent }}"
         run: |
           set -euo pipefail
-          AGENT="${{ matrix.agent }}"
           MARKER="<!-- ai-review:${AGENT} -->"
           REVIEW_DATE="$(date -u +%Y-%m-%d)"
 
-          # Delete existing comment for this agent (single page)
-          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
-            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" \
+          # Delete existing comment for this agent (single page). The marker is
+          # passed to jq with --arg instead of being spliced into the filter:
+          # agent names reach here from a caller-supplied `agents` input, and a
+          # quote in the name would otherwise alter the filter and could widen
+          # the DELETE loop to other comments.
+          COMMENTS_JSON=$(mktemp)
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" > "$COMMENTS_JSON"
+          jq -r --arg marker "${MARKER}" \
+            '.[] | select(.body | startswith($marker)) | .id' "$COMMENTS_JSON" \
             | while read -r cid; do
+                [ -n "${cid}" ] || continue
                 gh api -X DELETE "repos/${REPO}/issues/comments/${cid}" 2>/dev/null || true
               done
+          rm -f "$COMMENTS_JSON"
 
           # Compose and post. Sober wrapper: the marker MUST remain the very
           # first line (comment cleanup matches on startswith) and the body is
@@ -387,7 +447,7 @@ jobs:
             echo "${MARKER}"
             echo "## AI Review — \`${AGENT}\`"
             echo ""
-            echo "Model: lismodel1 · Commit: ${COMMIT_SHA} · ${REVIEW_DATE}"
+            echo "Model: ${REVIEW_MODEL} · Commit: ${COMMIT_SHA} · ${REVIEW_DATE}"
             echo ""
             cat "${OUTPUT_DIR}/${AGENT}.md"
           } > "${GITHUB_WORKSPACE}/comment-${AGENT}.md"
